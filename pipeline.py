@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Twitch/Kick VOD -> AI-picked clips -> 9:16 over gameplay + captions -> YouTube Shorts + Instagram Reels.
+"""Twitch/Kick VOD -> AI-picked clips -> 9:16 over gameplay + captions -> YouTube Shorts + Instagram Reels (posted via Zernio).
 Runs on GitHub Actions. Config is at the top; secrets come from environment variables."""
 import json
 import os
@@ -12,6 +12,8 @@ from pathlib import Path
 
 import requests
 
+import zernio_publish  # posts finished clips to YouTube + Instagram through Zernio
+
 # ---------------- CONFIG ----------------
 MAX_VODS_PER_RUN = 1          # VODs processed per workflow run
 MAX_CLIPS_PER_VOD = 4         # clips made per VOD
@@ -19,15 +21,10 @@ CLIP_MIN, CLIP_MAX = 25, 59   # clip length in seconds
 WHISPER_MODEL = "base"        # "small" = better accuracy, ~3x slower
 WAIT_AFTER_STREAM_MIN = 30    # skip VODs of streams that are live or ended < this many minutes ago
 LIST_DEPTH = 3                # newest N VODs checked per channel
-YT_CATEGORY = "20"            # 20 = Gaming
-GRAPH = "v25.0"               # Meta Graph API version
 
 env = os.environ.get
 GEMINI_KEY = env("GEMINI_API_KEY")
-YT_PRIVACY = env("YT_PRIVACY") or "public"
 GEMINI_MODELS = [m for m in [env("GEMINI_MODEL"), "gemini-3.8-flash", "gemini-3.6-flash", "gemini-2.5-flash"] if m]
-HAVE_YT = all(env(k) for k in ("YT_CLIENT_ID", "YT_CLIENT_SECRET", "YT_REFRESH_TOKEN"))
-HAVE_IG = all(env(k) for k in ("IG_USER_ID", "IG_ACCESS_TOKEN"))
 
 ROOT = Path(__file__).resolve().parent
 WORK, OUT = ROOT / "work", ROOT / "out"
@@ -259,54 +256,6 @@ def render(seg, ass, bg, out):
         "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart", out])
 
 
-# ---------------- publishing ----------------
-def youtube_upload(path, title, desc, tags):
-    r = requests.post("https://oauth2.googleapis.com/token", data={
-        "client_id": env("YT_CLIENT_ID"), "client_secret": env("YT_CLIENT_SECRET"),
-        "refresh_token": env("YT_REFRESH_TOKEN"), "grant_type": "refresh_token"}, timeout=60)
-    token = check(r, "YouTube token refresh").json()["access_token"]
-    meta = {"snippet": {"title": title[:100], "description": desc, "tags": [t.lstrip("#") for t in tags][:15],
-                        "categoryId": YT_CATEGORY},
-            "status": {"privacyStatus": YT_PRIVACY, "selfDeclaredMadeForKids": False}}
-    size = path.stat().st_size
-    r = requests.post("https://www.googleapis.com/upload/youtube/v3/videos?uploadType=resumable&part=snippet,status",
-                      headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json; charset=UTF-8",
-                               "X-Upload-Content-Type": "video/mp4", "X-Upload-Content-Length": str(size)},
-                      data=json.dumps(meta), timeout=60)
-    session = check(r, "YouTube start upload").headers["Location"]
-    with open(path, "rb") as f:
-        r = requests.put(session, data=f, headers={"Content-Type": "video/mp4", "Content-Length": str(size)},
-                         timeout=900)
-    return check(r, "YouTube upload").json()["id"]
-
-
-def instagram_reel(path, caption):
-    tok, uid = env("IG_ACCESS_TOKEN"), env("IG_USER_ID")
-    base = f"https://graph.facebook.com/{GRAPH}"
-    r = requests.post(f"{base}/{uid}/media", data={
-        "media_type": "REELS", "upload_type": "resumable", "caption": caption[:2200], "access_token": tok},
-        timeout=60)
-    cid = check(r, "IG create container").json()["id"]
-    size = path.stat().st_size
-    with open(path, "rb") as f:
-        r = requests.post(f"https://rupload.facebook.com/ig-api-upload/{GRAPH}/{cid}",
-                          headers={"Authorization": f"OAuth {tok}", "offset": "0", "file_size": str(size)},
-                          data=f, timeout=900)
-    check(r, "IG upload bytes")
-    for _ in range(60):
-        s = requests.get(f"{base}/{cid}", params={"fields": "status_code,status", "access_token": tok},
-                         timeout=60).json()
-        if s.get("status_code") == "FINISHED":
-            break
-        if s.get("status_code") in ("ERROR", "EXPIRED"):
-            raise RuntimeError(f"IG processing failed: {s}")
-        time.sleep(10)
-    else:
-        raise RuntimeError("IG processing timed out")
-    r = requests.post(f"{base}/{uid}/media_publish", data={"creation_id": cid, "access_token": tok}, timeout=60)
-    return check(r, "IG publish").json()["id"]
-
-
 # ---------------- per-VOD flow ----------------
 def process_vod(url, info):
     vid = re.sub(r"\W+", "_", str(info.get("id", "vod")))
@@ -342,20 +291,12 @@ def process_vod(url, info):
             final = OUT / f"{vid}_{i}.mp4"
             render(seg, ass, random.choice(backgrounds), final)
 
-            caption = f"{c['title']}\n\n{' '.join(c['tags'])}"
-            if HAVE_YT:
-                try:
-                    yid = youtube_upload(final, c["title"], caption + " #Shorts", c["tags"])
-                    print("   YouTube OK: https://youtube.com/shorts/" + yid)
-                    posted += 1
-                except Exception as e:
-                    print("   [YouTube FAILED]", e)
-            if HAVE_IG:
-                try:
-                    print("   Instagram OK, media id", instagram_reel(final, caption))
-                    posted += 1
-                except Exception as e:
-                    print("   [Instagram FAILED]", e)
+            caption = f"{c['title']}\n\n{' '.join(c['tags'])} #Shorts"
+            if not zernio_publish.enabled():
+                print("   ZERNIO_API_KEY not set: clip saved as a run artifact, not posted")
+                posted += 1  # rendered fine, so don't count the VOD as a failure
+            elif zernio_publish.publish(final, c["title"], caption, [t.lstrip("#") for t in c["tags"]]):
+                posted += 1
         except Exception as e:
             print(f"   [clip {i} FAILED]", e)
     return posted > 0
