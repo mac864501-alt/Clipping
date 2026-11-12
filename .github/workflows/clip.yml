@@ -1,0 +1,65 @@
+name: clipper
+
+on:
+  schedule:
+    - cron: "0 */6 * * *"   # every 6 hours
+  workflow_dispatch:
+    inputs:
+      video_url:
+        description: "Optional: one Twitch/Kick VOD URL to clip right now (leave empty for normal auto mode)"
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+
+concurrency:
+  group: clipper
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 340
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg fonts-dejavu-core
+          pip install -U "yt-dlp[default,curl-cffi]" faster-whisper requests
+
+      - name: Run clipper
+        env:
+          VIDEO_URL: ${{ github.event.inputs.video_url }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GEMINI_MODEL: ${{ vars.GEMINI_MODEL }}
+          YT_PRIVACY: ${{ vars.YT_PRIVACY }}
+          YT_CLIENT_ID: ${{ secrets.YT_CLIENT_ID }}
+          YT_CLIENT_SECRET: ${{ secrets.YT_CLIENT_SECRET }}
+          YT_REFRESH_TOKEN: ${{ secrets.YT_REFRESH_TOKEN }}
+          IG_USER_ID: ${{ secrets.IG_USER_ID }}
+          IG_ACCESS_TOKEN: ${{ secrets.IG_ACCESS_TOKEN }}
+        run: python pipeline.py
+
+      - name: Save state (which VODs are done)
+        if: always()
+        run: |
+          git config user.name "clipper-bot"
+          git config user.email "clipper-bot@users.noreply.github.com"
+          git add processed.json || true
+          git diff --cached --quiet || (git commit -m "update processed VODs" && git push)
+
+      - name: Keep finished clips for 3 days (for manual posting, e.g. TikTok)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: clips
+          path: out/*.mp4
+          retention-days: 3
+          if-no-files-found: ignore
