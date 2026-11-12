@@ -1,0 +1,6 @@
+# One channel per line. Lines starting with # are ignored.
+# Twitch works reliably. Replace CHANNEL_NAME with the streamer's name.
+https://www.twitch.tv/CHANNEL_NAME/videos?filter=archives&sort=time
+
+# Kick is experimental: Kick blocks many cloud servers, so this may find nothing.
+# https://kick.com/CHANNEL_NAME/videos
