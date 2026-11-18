@@ -1,5 +1,6 @@
 # One channel per line. Lines starting with # are ignored.
 # Twitch works reliably. Replace CHANNEL_NAME with the streamer's name.
+https://www.twitch.tv/ishowspeed/videos?filter=archives&sort=time
 https://www.twitch.tv/alanzoka/videos?filter=archives&sort=time
 https://www.twitch.tv/xqc/videos?filter=archives&sort=time
 https://www.twitch.tv/djmariio/videos?filter=archives&sort=time
