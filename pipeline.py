@@ -15,12 +15,16 @@ import requests
 import zernio_publish  # posts finished clips to YouTube + Instagram through Zernio
 
 # ---------------- CONFIG ----------------
-MAX_VODS_PER_RUN = 1          # VODs processed per workflow run
+MAX_VODS_PER_RUN = 2          # VODs processed per workflow run
 MAX_CLIPS_PER_VOD = 4         # clips made per VOD
 CLIP_MIN, CLIP_MAX = 25, 59   # clip length in seconds
 WHISPER_MODEL = "base"        # "small" = better accuracy, ~3x slower
 WAIT_AFTER_STREAM_MIN = 30    # skip VODs of streams that are live or ended < this many minutes ago
 LIST_DEPTH = 3                # newest N VODs checked per channel
+MAX_VOD_HOURS = 12            # VODs longer than this are skipped (too slow to transcribe on a free runner)
+CHUNK_CHARS = 40000           # transcript is sent to Gemini in pieces of about this many characters
+CLIPS_PER_CHUNK = 2           # moments asked from each piece (best ones overall are kept)
+MAX_MANUAL_LINKS = 5          # max links accepted in the manual "video_url" box
 
 env = os.environ.get
 GEMINI_KEY = env("GEMINI_API_KEY")
@@ -73,19 +77,23 @@ def channels():
 
 
 def list_vods(channel_url):
-    r = subprocess.run(["yt-dlp", "--flat-playlist", "--playlist-end", str(LIST_DEPTH), "--dump-json",
-                        "--no-warnings", channel_url], capture_output=True, text=True)
-    vods = []
-    for line in r.stdout.splitlines():
-        try:
-            d = json.loads(line)
-        except ValueError:
-            continue
-        url = d.get("url") or d.get("webpage_url")
-        if url:
-            vods.append({"id": str(d.get("id") or url), "url": url})
-    if not vods:
-        print(f"[warn] no VODs found for {channel_url}: {r.stderr[-300:]}")
+    for attempt in range(2):  # Twitch sometimes answers with an empty list, so try twice
+        r = subprocess.run(["yt-dlp", "--flat-playlist", "--playlist-end", str(LIST_DEPTH), "--dump-json",
+                            "--no-warnings", channel_url], capture_output=True, text=True)
+        vods = []
+        for line in r.stdout.splitlines():
+            try:
+                d = json.loads(line)
+            except ValueError:
+                continue
+            url = d.get("url") or d.get("webpage_url")
+            if url:
+                vods.append({"id": str(d.get("id") or url), "url": url})
+        if vods:
+            return vods
+        if attempt == 0:
+            time.sleep(5)
+    print(f"[warn] no VODs found for {channel_url}: {r.stderr[-300:]}")
     return vods
 
 
@@ -150,8 +158,13 @@ def gemini(prompt):
             "generationConfig": {"responseMimeType": "application/json", "temperature": 0.4}}
     for m in GEMINI_MODELS:
         for attempt in range(4):
-            r = requests.post(f"https://generativelanguage.googleapis.com/v1beta/models/{m}:generateContent",
-                              headers={"x-goog-api-key": GEMINI_KEY}, json=body, timeout=300)
+            try:
+                r = requests.post(f"https://generativelanguage.googleapis.com/v1beta/models/{m}:generateContent",
+                                  headers={"x-goog-api-key": GEMINI_KEY}, json=body, timeout=180)
+            except requests.RequestException as e:  # timeout / dropped connection: retry, then next model
+                print(f"[warn] Gemini {m} network error ({type(e).__name__}), attempt {attempt + 1}/4")
+                time.sleep(10 * (attempt + 1))
+                continue
             if r.status_code == 404:
                 print("[warn] Gemini model not found:", m)
                 break
@@ -166,10 +179,38 @@ def gemini(prompt):
     raise RuntimeError("Gemini: no model worked (set the GEMINI_MODEL repo variable to a current free Flash model)")
 
 
+def chunk_transcript(text):
+    """Split the transcript into pieces of about CHUNK_CHARS so a multi-hour stream fits in one Gemini call each."""
+    chunks, cur, size = [], [], 0
+    for line in text.splitlines():
+        if cur and size + len(line) > CHUNK_CHARS:
+            chunks.append("\n".join(cur))
+            cur, size = [], 0
+        cur.append(line)
+        size += len(line) + 1
+    if cur:
+        chunks.append("\n".join(cur))
+    return chunks
+
+
 def pick_clips(text, total):
-    raw = gemini(PROMPT.format(n=MAX_CLIPS_PER_VOD + 2, lo=CLIP_MIN, hi=CLIP_MAX, t=text))
-    if isinstance(raw, dict):
-        raw = raw.get("clips", [])
+    chunks = chunk_transcript(text)
+    per_chunk = MAX_CLIPS_PER_VOD + 2 if len(chunks) == 1 else CLIPS_PER_CHUNK
+    raw, good = [], 0
+    for n, chunk in enumerate(chunks, 1):
+        print(f"   Gemini piece {n}/{len(chunks)}", flush=True)
+        try:
+            part = gemini(PROMPT.format(n=per_chunk, lo=CLIP_MIN, hi=CLIP_MAX, t=chunk))
+            if isinstance(part, dict):
+                part = part.get("clips", [])
+            raw.extend(c for c in part if isinstance(c, dict))
+            good += 1
+        except Exception as e:  # one bad piece must not lose the whole stream
+            print(f"   [warn] Gemini piece {n} failed: {type(e).__name__}: {str(e)[:200]}")
+        if n < len(chunks):
+            time.sleep(5)  # stay under the free-tier requests-per-minute limit
+    if not good:
+        raise RuntimeError("Gemini failed on every piece of the transcript")
 
     def score(c):
         try:
@@ -198,14 +239,14 @@ def pick_clips(text, total):
 
 # ---------------- cutting + rendering ----------------
 def download_audio(url, dest_dir):
-    sh(["yt-dlp", "-f", "Audio_Only/ba/worst", "-x", "--audio-format", "mp3",
+    sh(["yt-dlp", "--no-progress", "-f", "Audio_Only/ba/worst", "-x", "--audio-format", "mp3",
         "--postprocessor-args", "ffmpeg:-ac 1 -ar 16000",
         "-o", dest_dir / "audio.%(ext)s", url])
     return dest_dir / "audio.mp3"
 
 
 def download_segment(url, start, end, dest):
-    sh(["yt-dlp", "-f", "best[height<=720]/best", "--download-sections", f"*{start:.1f}-{end:.1f}",
+    sh(["yt-dlp", "--no-progress", "-f", "best[height<=720]/best", "--download-sections", f"*{start:.1f}-{end:.1f}",
         "--force-keyframes-at-cuts", "--remux-video", "mp4", "-o", dest, url])
     if dest.exists():
         return dest
@@ -302,25 +343,46 @@ def process_vod(url, info):
     return posted > 0
 
 
+def seed_existing(targets, state):
+    """First run only: mark VODs that are already finished as seen, so old streams are never clipped.
+    A stream that is live right now is left alone and gets clipped once it has ended."""
+    marked = 0
+    for v in targets:
+        info = vod_info(v["url"])
+        if info and still_recording(info):
+            print("Live or just-ended stream, will be clipped after it ends:", v["url"])
+            continue
+        if v["id"] not in state["done"]:
+            state["done"].append(v["id"])
+            marked += 1
+    state["seeded"] = True
+    save_state(state)
+    print(f"First run: marked {marked} existing VODs as seen. New streams get clipped from now on.")
+
+
 def main():
     manual = (env("VIDEO_URL") or "").strip()
     WORK.mkdir(exist_ok=True)
     OUT.mkdir(exist_ok=True)
     state = load_state()
 
-    if manual:
-        targets = [{"id": manual, "url": manual, "force": True}]
+    if manual:  # one or more links, separated by commas, spaces or new lines
+        links = [u for u in re.split(r"[,\s]+", manual) if u][:MAX_MANUAL_LINKS]
+        targets = [{"id": u, "url": u, "force": True} for u in links]
+        limit = len(targets)
     else:
         targets = [v for ch in channels() for v in list_vods(ch)]
-        if not STATE.exists():  # first scheduled run: ignore old VODs, only clip new streams from now on
-            state["done"] = [v["id"] for v in targets]
-            save_state(state)
-            print(f"First run: marked {len(state['done'])} existing VODs as seen. New streams get clipped from now on.")
+        limit = MAX_VODS_PER_RUN
+        if not state.get("seeded"):
+            if not targets:
+                print("[warn] no VODs found at all (Twitch problem?), will try again next run")
+                return
+            seed_existing(targets, state)
             return
 
     handled = 0
     for t in targets:
-        if handled >= MAX_VODS_PER_RUN:
+        if handled >= limit:
             break
         if not t.get("force") and t["id"] in state["done"]:
             continue
@@ -329,6 +391,12 @@ def main():
             continue
         if not t.get("force") and still_recording(info):
             print("Stream still live or just ended, will retry next run:", t["url"])
+            continue
+        if (info.get("duration") or 0) > MAX_VOD_HOURS * 3600:
+            print(f"Skipping {t['url']}: longer than {MAX_VOD_HOURS} hours")
+            if not t.get("force"):
+                state["done"].append(t["id"])
+                save_state(state)
             continue
         handled += 1
         try:
