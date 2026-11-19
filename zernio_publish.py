@@ -12,6 +12,7 @@ Env vars
 """
 import os
 import time
+import uuid
 
 import requests
 
@@ -54,8 +55,10 @@ def _account_ids(platforms):
         r.raise_for_status()
         for acc in r.json().get("accounts", []):
             p = (acc.get("platform") or "").lower()
-            if p in missing and p not in ids:
-                ids[p] = acc["_id"]
+            acc_id = acc.get("_id") or acc.get("id")
+            if p in missing and p not in ids and acc_id:
+                ids[p] = acc_id
+                print(f"[zernio] using {p} account {acc.get('username') or acc.get('name') or acc_id}")
     return ids
 
 
@@ -124,13 +127,20 @@ def publish(video_path, title, caption, tags=None, wait_seconds=600):
     if tags:
         body["tags"] = [t[:100] for t in tags][:30]
 
-    r = _call("POST", "/posts", json=body)
+    # One Idempotency-Key per clip: if a retry happens after a timeout, Zernio returns the original post
+    # instead of creating (and publishing) a duplicate.
+    r = _call("POST", "/posts", json=body, headers={"Idempotency-Key": str(uuid.uuid4())})
+    print(f"[zernio] create post -> HTTP {r.status_code}: {r.text[:700]}")
+    if r.status_code == 409:
+        print("[zernio] Zernio says this post already exists or is still processing: not posting it again")
+        return True
     if r.status_code >= 400:
-        print(f"[zernio] create post failed {r.status_code}: {r.text[:500]}")
         return False
     data = r.json()
     post = data.get("post", data)
-    post_id = post.get("_id")
+    post_id = post.get("_id") or post.get("id")
+    if data.get("error"):
+        print(f"[zernio] warning from Zernio: {str(data['error'])[:300]}")
 
     deadline = time.time() + wait_seconds
     result = _summarise(post)
@@ -156,5 +166,9 @@ def publish(video_path, title, caption, tags=None, wait_seconds=600):
             line += f" -> {v['url']}"
         if v["error"]:
             line += f" ({v['error']})"
+        if v["status"] in PENDING:
+            line += "  [still not published after waiting: check the post in your Zernio dashboard]"
         print(line)
+    if not result:
+        print("[zernio] no per-platform result came back: check the post in your Zernio dashboard")
     return ok
