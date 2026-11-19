@@ -26,6 +26,10 @@ MAX_VOD_HOURS = 12            # VODs longer than this are skipped (too slow to t
 CHUNK_CHARS = 40000           # transcript is sent to Gemini in pieces of about this many characters
 CLIPS_PER_CHUNK = 2           # moments asked from each piece (best ones overall are kept)
 MAX_MANUAL_LINKS = 5          # max links accepted in the manual "video_url" box
+RUN_BUDGET_MIN = 270          # stop making/posting new clips after this many minutes (GitHub kills the job at 340,
+                              # and a killed job loses its progress, so the same clips would be posted again)
+START_NEW_VOD_BEFORE_MIN = 120  # don't start a 2nd VOD in the same run later than this
+RUN_START = time.time()
 
 # --- topic focus: most clips should be about one game/topic ---
 TOPIC = "GTA 6"              # topic to favour. Set to "" to turn this off
@@ -76,6 +80,10 @@ def probe_duration(p):
 
 def ts(t):
     return f"{int(t // 3600)}:{int(t % 3600 // 60):02d}:{t % 60:05.2f}"
+
+
+def minutes_used():
+    return (time.time() - RUN_START) / 60
 
 
 # ---------------- finding VODs ----------------
@@ -288,7 +296,8 @@ def pick_clips(text, total, chapters=None):
 
     if TOPIC:
         on_pool = [c for c in cands if c["topic"]]
-        take(on_pool, min(MAX_CLIPS_PER_VOD, round(MAX_CLIPS_PER_VOD * TOPIC_SHARE)))  # 1) the on-topic quota
+        quota = min(MAX_CLIPS_PER_VOD, math.ceil(MAX_CLIPS_PER_VOD * TOPIC_SHARE - 1e-9))  # at least this share (8 of 10)
+        take(on_pool, quota)                                                              # 1) the on-topic quota
         take(on_pool if TOPIC_STRICT else cands, MAX_CLIPS_PER_VOD)                    # 2) fill the rest
         print(f"   {sum(1 for c in clips if c['topic'])} of {len(clips)} clips are about {TOPIC}")
     else:
@@ -323,14 +332,41 @@ WrapStyle: 2
 
 [V4+ Styles]
 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-Style: Default,DejaVu Sans,84,&H00FFFFFF,&H000000FF,&H00000000,&H64000000,-1,0,0,0,100,100,0,0,1,7,2,8,60,60,960,1
+Style: Default,DejaVu Sans,84,&H00FFFFFF,&H000000FF,&H00000000,&H64000000,-1,0,0,0,100,100,0,0,1,7,2,8,60,60,@MV@,1
 
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 """
 
 
-def build_ass(words, path):
+# Layout of the 1080x1920 clip: gameplay background fills the whole screen, the stream clip sits in the
+# MIDDLE on top of it, and the captions go on the background just below the stream clip.
+STREAM_OFFSET = 0          # px to shift the stream clip from the exact middle (negative = up, positive = down)
+CAPTION_GAP = 40           # px between the bottom edge of the stream clip and the captions
+
+
+def probe_size(p):
+    r = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries",
+                        "stream=width,height", "-of", "csv=p=0:s=x", str(p)], capture_output=True, text=True)
+    w, h = r.stdout.strip().split("x")
+    return int(w), int(h)
+
+
+def layout(seg):
+    """Where the stream clip sits (y of its top edge) and the caption margin that keeps captions just below it."""
+    try:
+        w, h = probe_size(seg)
+        fg_h = int(round(1080 * h / w / 2)) * 2   # height after scaling to 1080 wide (even number)
+    except Exception:
+        fg_h = 608                                # normal 16:9 stream
+    y = max(0, min(1920 - fg_h, (1920 - fg_h) // 2 + STREAM_OFFSET))
+    return y, y + fg_h + CAPTION_GAP
+
+
+def build_ass(words, path, margin_v=None):
+    if margin_v is None:
+        margin_v = (1920 - 608) // 2 + STREAM_OFFSET + 608 + CAPTION_GAP   # same as layout() for a normal 16:9 stream
+    header = ASS_HEADER.replace("@MV@", str(margin_v))
     ev = []
     for i in range(0, len(words), 3):
         g = words[i:i + 3]
@@ -339,17 +375,19 @@ def build_ass(words, path):
             end = max(end, min(words[i + 3].start, end + 0.4))
         txt = re.sub(r"[{}\\]", "", " ".join(w.word.strip() for w in g)).upper()
         ev.append(f"Dialogue: 0,{ts(start)},{ts(end)},Default,,0,0,0,,{txt}")
-    path.write_text(ASS_HEADER + "\n".join(ev) + "\n", encoding="utf-8")
+    path.write_text(header + "\n".join(ev) + "\n", encoding="utf-8")
 
 
-def render(seg, ass, bg, out):
+def render(seg, ass, bg, out, y=None):
+    if y is None:
+        y = layout(seg)[0]
     dur = min(probe_duration(seg), 60)
     bg_len = probe_duration(bg)
     ss = random.uniform(0, max(0, bg_len - dur - 1))
     sub = f"[v]ass={ass}[vout]" if ass else "[v]null[vout]"
     fc = ("[1:v]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,setsar=1,fps=30[bg];"
           "[0:v]scale=1080:-2,setsar=1,fps=30[fg];"
-          "[bg][fg]overlay=0:300:shortest=1[v];" + sub)
+          f"[bg][fg]overlay=0:{y}:shortest=1[v];" + sub)
     sh(["ffmpeg", "-y", "-loglevel", "error", "-i", seg, "-stream_loop", "-1", "-ss", f"{ss:.2f}", "-i", bg,
         "-filter_complex", fc, "-map", "[vout]", "-map", "0:a:0?", "-t", f"{dur:.2f}",
         "-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-pix_fmt", "yuv420p",
@@ -378,18 +416,22 @@ def process_vod(url, info):
 
     posted = 0
     for i, c in enumerate(clips, 1):
+        if minutes_used() > RUN_BUDGET_MIN:
+            print(f"== out of time ({minutes_used():.0f} min used): skipping the remaining {len(clips) - i + 1} clips")
+            break
         try:
             print(f"== clip {i}: {c['title']} ({c['start']:.0f}-{c['end']:.0f}s)")
             seg = download_segment(url, c["start"], c["end"], w / f"seg{i}.mp4")
             wav = w / f"seg{i}.wav"
             sh(["ffmpeg", "-y", "-loglevel", "error", "-i", seg, "-vn", "-ac", "1", "-ar", "16000", wav])
             words = [x for s in transcribe(wav, words=True) for x in (s.words or [])]
+            y, margin_v = layout(seg)
             ass = None
             if words:
                 ass = w / f"seg{i}.ass"
-                build_ass(words, ass)
+                build_ass(words, ass, margin_v)
             final = OUT / f"{vid}_{i}.mp4"
-            render(seg, ass, random.choice(backgrounds), final)
+            render(seg, ass, random.choice(backgrounds), final, y)
 
             caption = f"{c['title']}\n\n{' '.join(c['tags'])} #Shorts"
             if not zernio_publish.enabled():
@@ -442,6 +484,9 @@ def main():
     handled = 0
     for t in targets:
         if handled >= limit:
+            break
+        if handled and minutes_used() > START_NEW_VOD_BEFORE_MIN:
+            print(f"{minutes_used():.0f} min used already: leaving the other VODs for the next run")
             break
         if not t.get("force") and t["id"] in state["done"]:
             continue
