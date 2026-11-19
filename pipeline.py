@@ -2,6 +2,7 @@
 """Twitch/Kick VOD -> AI-picked clips -> 9:16 over gameplay + captions -> YouTube Shorts + Instagram Reels (posted via Zernio).
 Runs on GitHub Actions. Config is at the top; secrets come from environment variables."""
 import json
+import math
 import os
 import random
 import re
@@ -25,6 +26,15 @@ MAX_VOD_HOURS = 12            # VODs longer than this are skipped (too slow to t
 CHUNK_CHARS = 40000           # transcript is sent to Gemini in pieces of about this many characters
 CLIPS_PER_CHUNK = 2           # moments asked from each piece (best ones overall are kept)
 MAX_MANUAL_LINKS = 5          # max links accepted in the manual "video_url" box
+
+# --- topic focus: most clips should be about one game/topic ---
+TOPIC = "GTA 6"              # topic to favour. Set to "" to turn this off
+TOPIC_SHARE = 0.8            # share of each VOD's clips that should be about TOPIC (8 of 10)
+TOPIC_STRICT = False         # False: fill the remaining slots with the best other moments
+                             # True:  only post on-topic clips (fewer clips if the stream has little of it)
+# A moment counts as on-topic if Gemini says so, OR the Twitch game/category at that time matches,
+# OR the transcript around it mentions this pattern (GTA 6 / GTA6 / GTA VI / GTA six / Grand Theft Auto VI / Leonida):
+TOPIC_PATTERN = r"(gta|g\.t\.a\.?|grand theft auto)\s*[-:]?\s*(6|vi|six)\b|leonida"
 
 env = os.environ.get
 GEMINI_KEY = env("GEMINI_API_KEY")
@@ -146,7 +156,7 @@ def transcript_text(segs):
 PROMPT = """You are a short-form video editor. Below is a livestream transcript. Each line starts with [seconds from stream start].
 Pick up to {n} of the most engaging moments: funny, shocking, hype, emotional, or a complete mini-story with a clear payoff.
 Rules: each clip is {lo}-{hi} seconds long, starts at the beginning of a sentence, ends right after the payoff, clips must not overlap.
-Return ONLY a JSON array. Each item: {{"start": <seconds>, "end": <seconds>, "title": "<catchy title, max 70 chars, no hashtags>", "hashtags": ["#tag1","#tag2","#tag3","#tag4","#tag5"], "score": <1-10>}}
+{topic_rule}Return ONLY a JSON array. Each item: {{"start": <seconds>, "end": <seconds>, "title": "<catchy title, max 70 chars, no hashtags>", "hashtags": ["#tag1","#tag2","#tag3","#tag4","#tag5"], "score": <1-10>, "on_topic": <true or false>}}
 
 TRANSCRIPT:
 {t}
@@ -193,14 +203,44 @@ def chunk_transcript(text):
     return chunks
 
 
-def pick_clips(text, total):
+def topic_rule():
+    if not TOPIC:
+        return ""
+    return (f"Strongly prefer moments about {TOPIC}: the streamer playing it, talking about it, reacting to news or "
+            f"trailers about it, or hyped about it. Set \"on_topic\" to true for those and false for every other moment. "
+            f"If this part of the transcript has no {TOPIC} content, just return its best moments with on_topic false.\n")
+
+
+def is_on_topic(c, s, e, lines, chapters):
+    """True if Gemini flagged it, or the Twitch game/category at that time matches, or the transcript mentions it."""
+    if not TOPIC:
+        return False
+    if str(c.get("on_topic")).strip().lower() == "true":
+        return True
+    rx = re.compile(TOPIC_PATTERN, re.I)
+    for ch in chapters or []:
+        try:
+            if float(ch.get("start_time", 0)) <= s < float(ch.get("end_time") or 1e12) and rx.search(str(ch.get("title", ""))):
+                return True
+        except (TypeError, ValueError, AttributeError):
+            continue
+    return any(rx.search(t) for sec, t in lines if s - 15 <= sec <= e)
+
+
+def pick_clips(text, total, chapters=None):
     chunks = chunk_transcript(text)
-    per_chunk = MAX_CLIPS_PER_VOD + 2 if len(chunks) == 1 else CLIPS_PER_CHUNK
+    want = MAX_CLIPS_PER_VOD * 2 if TOPIC else MAX_CLIPS_PER_VOD + 2   # candidates to collect before choosing
+    per_chunk = max(CLIPS_PER_CHUNK, math.ceil(want / len(chunks)))
+    lines = []
+    for ln in text.splitlines():
+        m = re.match(r"\[(\d+)\]\s*(.*)", ln)
+        if m:
+            lines.append((int(m.group(1)), m.group(2)))
     raw, good = [], 0
     for n, chunk in enumerate(chunks, 1):
         print(f"   Gemini piece {n}/{len(chunks)}", flush=True)
         try:
-            part = gemini(PROMPT.format(n=per_chunk, lo=CLIP_MIN, hi=CLIP_MAX, t=chunk))
+            part = gemini(PROMPT.format(n=per_chunk, lo=CLIP_MIN, hi=CLIP_MAX, t=chunk, topic_rule=topic_rule()))
             if isinstance(part, dict):
                 part = part.get("clips", [])
             raw.extend(c for c in part if isinstance(c, dict))
@@ -218,7 +258,8 @@ def pick_clips(text, total):
         except (TypeError, ValueError):
             return 0
 
-    clips = []
+    topic_tag = "#" + re.sub(r"\W", "", TOPIC) if TOPIC else ""
+    cands = []  # every valid moment, best score first
     for c in sorted(raw, key=score):
         try:
             s, e = float(c["start"]), float(c["end"])
@@ -228,13 +269,31 @@ def pick_clips(text, total):
             e = s + CLIP_MAX
         if s < 0 or e - s < 15 or (total and s >= total):
             continue
-        if any(s < x["end"] and e > x["start"] for x in clips):
-            continue
         tags = [("#" + str(t).lstrip("#").replace(" ", "")) for t in (c.get("hashtags") or [])][:6]
-        clips.append({"start": s, "end": e, "title": str(c.get("title", "Stream highlight"))[:90], "tags": tags})
-        if len(clips) >= MAX_CLIPS_PER_VOD:
-            break
-    return clips
+        on = is_on_topic(c, s, e, lines, chapters)
+        if on and topic_tag and topic_tag.lower() not in [t.lower() for t in tags]:
+            tags = [topic_tag] + tags[:5]
+        cands.append({"start": s, "end": e, "title": str(c.get("title", "Stream highlight"))[:90],
+                      "tags": tags, "topic": on})
+
+    clips = []
+
+    def take(pool, limit):
+        for c in pool:
+            if len(clips) >= limit:
+                return
+            if any(c["start"] < x["end"] and c["end"] > x["start"] for x in clips):
+                continue
+            clips.append(c)
+
+    if TOPIC:
+        on_pool = [c for c in cands if c["topic"]]
+        take(on_pool, min(MAX_CLIPS_PER_VOD, round(MAX_CLIPS_PER_VOD * TOPIC_SHARE)))  # 1) the on-topic quota
+        take(on_pool if TOPIC_STRICT else cands, MAX_CLIPS_PER_VOD)                    # 2) fill the rest
+        print(f"   {sum(1 for c in clips if c['topic'])} of {len(clips)} clips are about {TOPIC}")
+    else:
+        take(cands, MAX_CLIPS_PER_VOD)
+    return sorted(clips, key=lambda c: c["start"])
 
 
 # ---------------- cutting + rendering ----------------
@@ -314,7 +373,7 @@ def process_vod(url, info):
         return False
 
     print("== asking Gemini for the best moments")
-    clips = pick_clips(text, info.get("duration"))
+    clips = pick_clips(text, info.get("duration"), info.get("chapters"))
     print(f"== {len(clips)} clips selected")
 
     posted = 0
