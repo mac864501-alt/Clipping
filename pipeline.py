@@ -10,6 +10,7 @@ import shutil
 import subprocess
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import requests
 
@@ -29,6 +30,7 @@ MAX_MANUAL_LINKS = 5          # max links accepted in the manual "video_url" box
 RUN_BUDGET_MIN = 270          # stop making/posting new clips after this many minutes (GitHub kills the job at 340,
                               # and a killed job loses its progress, so the same clips would be posted again)
 START_NEW_VOD_BEFORE_MIN = 120  # don't start a 2nd VOD in the same run later than this
+PART_SECONDS = 1800           # long VODs are transcribed in pieces of this length (keeps memory use small)
 RUN_START = time.time()
 
 # --- topic focus: most clips should be about one game/topic ---
@@ -144,6 +146,29 @@ def whisper():
 def transcribe(path, words=False):
     segs, _ = whisper().transcribe(str(path), vad_filter=True, beam_size=1, word_timestamps=words)
     return list(segs)
+
+
+def transcribe_long(path, workdir):
+    """Transcribe a long recording in PART_SECONDS pieces. Whisper needs about 2.5 GB of memory per hour of audio
+    when given the whole file at once, which crashes a free GitHub runner (16 GB) on streams of ~8+ hours."""
+    parts_dir = Path(workdir) / "parts"
+    parts_dir.mkdir(exist_ok=True)
+    sh(["ffmpeg", "-y", "-loglevel", "error", "-i", path, "-f", "segment", "-segment_time", PART_SECONDS,
+        "-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le", parts_dir / "part%04d.wav"])
+    parts = sorted(parts_dir.glob("part*.wav"))
+    if not parts:
+        raise RuntimeError("could not split the audio into pieces")
+    Path(path).unlink(missing_ok=True)  # the big mp3 is no longer needed
+    segs, offset = [], 0.0
+    for n, part in enumerate(parts, 1):
+        if minutes_used() > RUN_BUDGET_MIN:
+            raise RuntimeError(f"out of time while transcribing ({minutes_used():.0f} min used)")
+        print(f"   transcribing part {n}/{len(parts)} ({minutes_used():.0f} min used)", flush=True)
+        for s in transcribe(part):
+            segs.append(SimpleNamespace(start=s.start + offset, end=s.end + offset, text=s.text))
+        offset += probe_duration(part)  # real length of this piece, so timestamps stay exact
+        part.unlink()
+    return segs
 
 
 def transcript_text(segs):
@@ -404,7 +429,7 @@ def process_vod(url, info):
         raise RuntimeError("Put at least one .mp4 in the backgrounds/ folder")
 
     print("== downloading audio + transcribing")
-    segs = transcribe(download_audio(url, w))
+    segs = transcribe_long(download_audio(url, w), w)
     text = transcript_text(segs)
     if len(text) < 300:
         print("[warn] almost no speech detected, skipping")
